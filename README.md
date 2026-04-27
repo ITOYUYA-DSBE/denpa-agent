@@ -31,6 +31,19 @@ Apple Vision Pro
 → Denpa Agent Server  
 → Codex / Claude Code
 
+## Network
+
+Denpa Agent は、Mac上で動く local server に接続して動作します。
+
+Apple Vision Pro と Mac が同じローカルネットワーク上にある場合は、MacのローカルIPを使えます。
+
+外出先から自宅Macに接続する場合は、MacとApple Vision Proの両方に Tailscale を入れ、MacのTailscale IPを `baseURL` に設定してください。
+
+Example:
+
+```swift
+private let baseURL = "http://YOUR_TAILSCALE_IP:8787"
+
 ## Requirements
 
 ### Mac

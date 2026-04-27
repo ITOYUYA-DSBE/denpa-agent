@@ -1,5 +1,7 @@
 # Denpa Agent 📡
 
+![Denpa Agent Hero](./denpa-agent-hero.jpg)
+
 **A spatial receiver for local AI agents.**
 
 Denpa Agent は、Apple Vision Pro から Mac 上で動くローカルAIコーディングエージェントを操作するための実験的な visionOS アプリです。

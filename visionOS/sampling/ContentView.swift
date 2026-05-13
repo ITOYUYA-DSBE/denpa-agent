@@ -2,7 +2,7 @@
 //  ContentView.swift
 //  sampling
 //
-//  Denpa Agent v1.2
+//  Denpa Agent v1.3
 //
 
 import SwiftUI
@@ -28,38 +28,118 @@ struct StatusResponse: Decodable {
     let stderr: String?
 }
 
+struct ReposResponse: Decodable {
+    let repos: [String]
+}
+
 @MainActor
 final class DenpaViewModel: ObservableObject {
     @Published var prompt: String = "Reply with exactly: OK"
 
-    @Published var selectedChannel: String = "codex"
+    // Repo
+    @Published var repos: [String] = []
+    @Published var selectedRepo: String = "sampling"
+    @Published var repoStateText: String = "Repo: not loaded"
+
+    // Channel: multiple selection
+    @Published var useCodex: Bool = true
+    @Published var useClaude: Bool = false
+
     @Published var selectedAccessLevel: String = "listen"
 
     @Published var isReceiving = false
+    @Published var isDualTransmission = false
+
     @Published var jobId: String?
     @Published var stateText = "Idle"
     @Published var transmissionText = ""
+    @Published var codexTransmissionText = ""
+    @Published var claudeTransmissionText = ""
     @Published var errorText = ""
 
     // 必要に応じて Tailscale IP / ローカルIP に変更
     private let baseURL = "http://100.69.172.128:8787"
-    private let repo = "sampling"
+
+    var isDualChannel: Bool {
+        useCodex && useClaude
+    }
+
+    func loadRepos() async {
+        repoStateText = "Repo: loading..."
+
+        do {
+            guard let url = URL(string: "\(baseURL)/repos") else {
+                throw URLError(.badURL)
+            }
+
+            let (data, response) = try await URLSession.shared.data(from: url)
+            try validateHTTP(response: response, data: data)
+
+            let result = try JSONDecoder().decode(ReposResponse.self, from: data)
+            repos = result.repos
+
+            if repos.isEmpty {
+                repoStateText = "Repo: no repos found"
+                return
+            }
+
+            if !repos.contains(selectedRepo) {
+                selectedRepo = repos[0]
+            }
+
+            repoStateText = "Repo: \(selectedRepo)"
+        } catch {
+            repoStateText = "Repo: failed to load"
+            errorText = error.localizedDescription
+        }
+    }
+
+    func toggleCodex() {
+        // 両方OFFを防ぐ
+        if useCodex && !useClaude {
+            return
+        }
+        useCodex.toggle()
+    }
+
+    func toggleClaude() {
+        // 両方OFFを防ぐ
+        if useClaude && !useCodex {
+            return
+        }
+        useClaude.toggle()
+    }
 
     func transmit() async {
         guard !isReceiving else { return }
 
         isReceiving = true
+        isDualTransmission = isDualChannel
         jobId = nil
         transmissionText = ""
+        codexTransmissionText = ""
+        claudeTransmissionText = ""
         errorText = ""
-        stateText = "Receiving..."
+        stateText = isDualChannel ? "Receiving dual signals..." : "Receiving..."
 
         do {
-            let response = try await startTransmission()
-            jobId = response.jobId
-            stateText = "Receiving..."
+            if isDualChannel {
+                try await dualTransmit()
+            } else {
+                let engine = useClaude ? "claude" : "codex"
 
-            try await pollUntilComplete(jobId: response.jobId)
+                let response = try await startTransmission(
+                    repo: selectedRepo,
+                    engine: engine,
+                    accessLevel: selectedAccessLevel,
+                    prompt: prompt
+                )
+
+                jobId = response.jobId
+                stateText = "Receiving..."
+
+                try await pollUntilComplete(jobId: response.jobId)
+            }
         } catch {
             errorText = error.localizedDescription
             stateText = "Failed"
@@ -67,7 +147,62 @@ final class DenpaViewModel: ObservableObject {
         }
     }
 
-    private func startTransmission() async throws -> RunResponse {
+    private var dualProposalPrompt: String {
+        """
+        You are in Dual Transmission proposal mode.
+
+        Do not modify, create, delete, rename, or write any files.
+        Do not run commands that change files.
+        Do not execute build, install, format, or git commands that modify the repository.
+
+        Only provide:
+        - your interpretation of the request
+        - a proposed implementation plan
+        - risks or concerns
+        - a suggested next prompt for applying the change later
+
+        The user will compare your signal with another agent and may retransmit later using a single channel.
+
+        User request:
+        \(prompt)
+        """
+    }
+
+    private func dualTransmit() async throws {
+        stateText = "Receiving Codex Signal..."
+
+        let codexResponse = try await startTransmission(
+            repo: selectedRepo,
+            engine: "codex",
+            accessLevel: "listen",
+            prompt: dualProposalPrompt
+        )
+
+        let codexStatus = try await pollForResult(jobId: codexResponse.jobId)
+        codexTransmissionText = codexStatus.stdout ?? "(empty Codex signal)"
+
+        stateText = "Receiving Claude Code Signal..."
+
+        let claudeResponse = try await startTransmission(
+            repo: selectedRepo,
+            engine: "claude",
+            accessLevel: "listen",
+            prompt: dualProposalPrompt
+        )
+
+        let claudeStatus = try await pollForResult(jobId: claudeResponse.jobId)
+        claudeTransmissionText = claudeStatus.stdout ?? "(empty Claude Code signal)"
+
+        stateText = "Completed"
+        isReceiving = false
+    }
+
+    private func startTransmission(
+        repo: String,
+        engine: String,
+        accessLevel: String,
+        prompt: String
+    ) async throws -> RunResponse {
         guard let url = URL(string: "\(baseURL)/run") else {
             throw URLError(.badURL)
         }
@@ -80,8 +215,8 @@ final class DenpaViewModel: ObservableObject {
         let body: [String: String] = [
             "repo": repo,
             "prompt": prompt,
-            "engine": selectedChannel,
-            "accessLevel": selectedAccessLevel
+            "engine": engine,
+            "accessLevel": accessLevel
         ]
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -129,6 +264,27 @@ final class DenpaViewModel: ObservableObject {
         }
     }
 
+    private func pollForResult(jobId: String) async throws -> StatusResponse {
+        while true {
+            let status = try await fetchStatus(jobId: jobId)
+
+            if status.status == "completed" {
+                return status
+            }
+
+            if status.status == "failed" {
+                let stderr = status.stderr ?? "(no stderr)"
+                throw NSError(
+                    domain: "DenpaAgent",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Transmission failed: \(stderr)"]
+                )
+            }
+
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
     private func validateHTTP(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
@@ -169,6 +325,8 @@ struct ContentView: View {
 
                     cubeReceiverView
 
+                    targetRepoView
+
                     channelView
 
                     accessLevelView
@@ -187,6 +345,9 @@ struct ContentView: View {
                 .frame(width: 640, alignment: .leading)
             }
             .scrollContentBackground(.hidden)
+        }
+        .task {
+            await vm.loadRepos()
         }
     }
 
@@ -217,7 +378,7 @@ struct ContentView: View {
 
     private var headerView: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Denpa Agent 📡")
+            Text("Denpa Agent 1.3 📡")
                 .font(.largeTitle)
                 .bold()
                 .foregroundStyle(.white)
@@ -287,7 +448,7 @@ struct ContentView: View {
                     .fontWeight(.semibold)
                     .foregroundStyle(textSoft)
 
-                Text("Tune into a local agent and transmit a prompt.")
+                Text("Tune into local agents and transmit a prompt.")
                     .font(.footnote)
                     .foregroundStyle(textDim)
 
@@ -316,6 +477,20 @@ struct ContentView: View {
                             .font(.footnote)
                             .foregroundStyle(textDim)
                     }
+
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(vm.repos.isEmpty ? Color.gray.opacity(0.8) : denpaGreen)
+                            .frame(width: 8, height: 8)
+                            .shadow(
+                                color: vm.repos.isEmpty ? .clear : denpaGreen.opacity(0.8),
+                                radius: 8
+                            )
+
+                        Text(vm.repoStateText)
+                            .font(.footnote)
+                            .foregroundStyle(textDim)
+                    }
                 }
             }
         }
@@ -330,32 +505,72 @@ struct ContentView: View {
         )
     }
 
+    private var targetRepoView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Target Repo")
+
+            if vm.repos.isEmpty {
+                Text("No repos loaded. Check Denpa Agent Server.")
+                    .font(.footnote)
+                    .foregroundStyle(textDim)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Color.black.opacity(0.55))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(possessPink.opacity(0.35), lineWidth: 1)
+                            )
+                    )
+            } else {
+                Picker("Target Repo", selection: $vm.selectedRepo) {
+                    ForEach(vm.repos, id: \.self) { repo in
+                        Text(repo).tag(repo)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(denpaGreen)
+
+                Text("Selected repo must match a key in agent/repos.json.")
+                    .font(.footnote)
+                    .foregroundStyle(textDim)
+            }
+        }
+    }
+
     private var channelView: some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("Channel")
 
             HStack(spacing: 12) {
                 Button {
-                    vm.selectedChannel = "codex"
+                    vm.toggleCodex()
                 } label: {
                     Text("Codex")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(vm.selectedChannel == "codex" ? denpaGreen : Color.gray.opacity(0.55))
-                .foregroundStyle(vm.selectedChannel == "codex" ? .black : .white)
+                .tint(vm.useCodex ? denpaGreen : Color.gray.opacity(0.55))
+                .foregroundStyle(vm.useCodex ? .black : .white)
 
                 Button {
-                    vm.selectedChannel = "claude"
+                    vm.toggleClaude()
                 } label: {
                     Text("Claude Code")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(vm.selectedChannel == "claude" ? denpaGreen : Color.gray.opacity(0.55))
-                .foregroundStyle(vm.selectedChannel == "claude" ? .black : .white)
+                .tint(vm.useClaude ? denpaGreen : Color.gray.opacity(0.55))
+                .foregroundStyle(vm.useClaude ? .black : .white)
+            }
+
+            if vm.isDualChannel {
+                Text("Dual Channel receives proposals only. Choose one signal, then retransmit.")
+                    .font(.footnote)
+                    .foregroundStyle(textDim)
             }
         }
     }
@@ -387,7 +602,7 @@ struct ContentView: View {
                 )
             }
 
-            Text(accessDescription)
+            Text(vm.isDualChannel ? "Dual Channel forces Listen access to avoid interference." : accessDescription)
                 .font(.footnote)
                 .foregroundStyle(textDim)
         }
@@ -482,6 +697,7 @@ struct ContentView: View {
         .shadow(color: denpaGreen.opacity(vm.isReceiving ? 0.65 : 0.38), radius: vm.isReceiving ? 22 : 12)
         .disabled(
             vm.isReceiving ||
+            vm.repos.isEmpty ||
             vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
     }
@@ -494,7 +710,8 @@ struct ContentView: View {
                 .font(.body)
                 .foregroundStyle(textSoft)
 
-            HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Repo: \(vm.selectedRepo)")
                 Text("Channel: \(channelLabel)")
                 Text("Access: \(accessLabel)")
             }
@@ -533,13 +750,53 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("Transmission")
 
+            if vm.isDualTransmission {
+                VStack(alignment: .leading, spacing: 14) {
+                    signalBlock(
+                        title: "Codex Signal",
+                        text: vm.codexTransmissionText.isEmpty ? "No Codex signal yet." : vm.codexTransmissionText
+                    )
+
+                    signalBlock(
+                        title: "Claude Code Signal",
+                        text: vm.claudeTransmissionText.isEmpty ? "No Claude Code signal yet." : vm.claudeTransmissionText
+                    )
+                }
+            } else {
+                ScrollView {
+                    Text(vm.transmissionText.isEmpty ? "No transmission yet." : vm.transmissionText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(textSoft)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 320)
+                .padding()
+                .background(
+                    RoundedRectangle(cornerRadius: 18)
+                        .fill(Color.black.opacity(0.48))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18)
+                                .stroke(denpaGreen.opacity(0.16), lineWidth: 1)
+                        )
+                )
+            }
+        }
+    }
+
+    private func signalBlock(title: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .fontWeight(.semibold)
+                .foregroundStyle(denpaGreen)
+
             ScrollView {
-                Text(vm.transmissionText.isEmpty ? "No transmission yet." : vm.transmissionText)
+                Text(text)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .foregroundStyle(textSoft)
                     .textSelection(.enabled)
             }
-            .frame(maxHeight: 320)
+            .frame(maxHeight: 220)
             .padding()
             .background(
                 RoundedRectangle(cornerRadius: 18)
@@ -559,10 +816,22 @@ struct ContentView: View {
     }
 
     private var channelLabel: String {
-        vm.selectedChannel == "claude" ? "Claude Code" : "Codex"
+        if vm.useCodex && vm.useClaude {
+            return "Codex + Claude Code"
+        }
+
+        if vm.useClaude {
+            return "Claude Code"
+        }
+
+        return "Codex"
     }
 
     private var accessLabel: String {
+        if vm.isDualChannel {
+            return "Listen / Proposal Only"
+        }
+
         switch vm.selectedAccessLevel {
         case "listen":
             return "Listen"
